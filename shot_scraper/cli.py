@@ -133,6 +133,15 @@ def reduced_motion_option(fn):
     return fn
 
 
+def color_scheme_option(fn):
+    click.option(
+        "--color-scheme",
+        type=click.Choice(["light", "dark"], case_sensitive=False),
+        help="Emulate 'prefers-color-scheme' media feature",
+    )(fn)
+    return fn
+
+
 @click.group(
     cls=DefaultGroup,
     default="shot",
@@ -241,6 +250,7 @@ def cli():
 @browser_args_option
 @user_agent_option
 @reduced_motion_option
+@color_scheme_option
 @skip_fail_options
 @bypass_csp_option
 @silent_option
@@ -272,6 +282,7 @@ def shot(
     browser_args,
     user_agent,
     reduced_motion,
+    color_scheme,
     skip,
     fail,
     bypass_csp,
@@ -342,6 +353,7 @@ def shot(
             user_agent=user_agent,
             timeout=timeout,
             reduced_motion=reduced_motion,
+            color_scheme=color_scheme,
             bypass_csp=bypass_csp,
             auth_username=auth_username,
             auth_password=auth_password,
@@ -397,6 +409,7 @@ def _browser_context(
     user_agent=None,
     timeout=None,
     reduced_motion=False,
+    color_scheme=None,
     bypass_csp=False,
     auth_username=None,
     auth_password=None,
@@ -421,6 +434,8 @@ def _browser_context(
         context_args["device_scale_factor"] = scale_factor
     if reduced_motion:
         context_args["reduced_motion"] = "reduce"
+    if color_scheme:
+        context_args["color_scheme"] = color_scheme
     if user_agent is not None:
         context_args["user_agent"] = user_agent
     if bypass_csp:
@@ -475,6 +490,7 @@ def _browser_context(
 @browser_args_option
 @user_agent_option
 @reduced_motion_option
+@color_scheme_option
 @log_console_option
 @skip_fail_options
 @silent_option
@@ -513,6 +529,7 @@ def multi(
     browser_args,
     user_agent,
     reduced_motion,
+    color_scheme,
     log_console,
     skip,
     fail,
@@ -570,6 +587,7 @@ def multi(
             user_agent=user_agent,
             timeout=timeout,
             reduced_motion=reduced_motion,
+            color_scheme=color_scheme,
             auth_username=auth_username,
             auth_password=auth_password,
             record_har_path=har_file or None,
@@ -787,8 +805,53 @@ def har(
             page.on("console", console_log)
         response = page.goto(url)
         skip_or_fail(response, skip, fail)
-        if wait:
-            time.sleep(wait / 1000)
+    if wait:
+        # For small wait values, interpret as seconds instead of milliseconds for usability
+        actual_wait_ms = wait * 1000 if wait < 100 else wait
+        
+        # First wait for network to be idle
+        try:
+            page.wait_for_load_state("networkidle", timeout=actual_wait_ms)
+        except TimeoutError:
+            pass  # Continue even if network doesn't become idle
+        
+        # Then wait for DOM content to be fully loaded
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except TimeoutError:
+            pass
+            
+        # Execute JavaScript to check for any pending network requests and animations
+        try:
+            page.evaluate("""
+                () => new Promise((resolve) => {
+                    // Give time for any animations or delayed content to complete
+                    let checkReadyState = () => {
+                        if (document.readyState === 'complete') {
+                            // Check if there are any images/frames still loading
+                            const notLoaded = Array.from(document.querySelectorAll('img, iframe'))
+                                .filter(el => !el.complete);
+                            
+                            if (notLoaded.length === 0) {
+                                // Wait a bit longer for any final rendering
+                                setTimeout(resolve, 500);
+                            } else {
+                                setTimeout(checkReadyState, 100);
+                            }
+                        } else {
+                            setTimeout(checkReadyState, 100);
+                        }
+                    };
+                    checkReadyState();
+                })
+            """, timeout=actual_wait_ms / 2)
+        except Error:
+            # If JavaScript evaluation fails or times out, still continue
+            pass
+            
+        # Finally, ensure we wait at least the minimum specified time
+        # This gives a chance for CSS animations and transitions to complete
+        time.sleep(min(2, actual_wait_ms / 1000))  # Wait at least some time but not more than 2 seconds
 
         if javascript:
             _evaluate_js(page, javascript)
@@ -1026,7 +1089,12 @@ def pdf(
         response = page.goto(url)
         skip_or_fail(response, skip, fail)
         if wait:
-            time.sleep(wait / 1000)
+            # Wait for network to be idle and ensure a minimum wait time
+            try:
+                page.wait_for_load_state("networkidle", timeout=wait)
+            except TimeoutError:
+                # If networkidle times out, still wait the full requested time
+                time.sleep(wait / 1000)
         if javascript:
             _evaluate_js(page, javascript)
         if wait_for:
@@ -1136,7 +1204,12 @@ def html(
         response = page.goto(url)
         skip_or_fail(response, skip, fail)
         if wait:
-            time.sleep(wait / 1000)
+            # Wait for network to be idle and ensure a minimum wait time
+            try:
+                page.wait_for_load_state("networkidle", timeout=wait)
+            except TimeoutError:
+                # If networkidle times out, still wait the full requested time
+                time.sleep(wait / 1000)
         if javascript:
             _evaluate_js(page, javascript)
 
@@ -1342,7 +1415,12 @@ def take_shot(
                 raise click.ClickException(f"{response.status} error for {url}")
 
     if wait:
-        time.sleep(wait / 1000)
+        # Wait for network to be idle and ensure a minimum wait time
+        try:
+            page.wait_for_load_state("networkidle", timeout=wait)
+        except TimeoutError:
+            # If networkidle times out, still wait the full requested time
+            time.sleep(wait / 1000)
 
     javascript = shot.get("javascript")
     if javascript:
